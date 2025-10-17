@@ -1,11 +1,11 @@
 // server.js
-// API-only backend for alias generation and inbound email handling.
+// API-only backend for alias generation + inbound email handling (Postmark).
 // Endpoints:
 //   POST /api/session           -> { alias, dobISO, dobPretty, email }
 //   GET  /api/messages/:alias   -> { alias, messages: [rawPostmarkJson...] }
 //   GET  /api/stream/:alias     -> SSE stream for live messages
-//   POST /inbound               -> Postmark inbound webhook (raw JSON)
-//   GET  /healthz               -> { ok: true }
+//   POST /inbound               -> Postmark inbound webhook (RAW JSON passthrough)
+//   GET  /healthz               -> { ok: true, domain, corsOrigin }
 
 import express from "express";
 import cors from "cors";
@@ -17,21 +17,24 @@ const app = express();
 app.use(express.json({ limit: "15mb" }));
 
 // -------- CONFIG (env) --------
-const INBOUND_DOMAIN   = process.env.INBOUND_DOMAIN   || "in.nullref.com";
-const FRONTEND_ORIGIN  = process.env.FRONTEND_ORIGIN  || "*"; // set to your frontend origin in prod
-const WEBHOOK_USER     = process.env.WEBHOOK_USER     || "";  // optional
-const WEBHOOK_PASS     = process.env.WEBHOOK_PASS     || "";  // optional
-const REQUIRE_AUTH     = Boolean(WEBHOOK_USER && WEBHOOK_PASS);
+const INBOUND_DOMAIN  = process.env.INBOUND_DOMAIN  || "in.refnull.net";
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*"; // set to your Pages/host URL in prod
+const WEBHOOK_USER    = process.env.WEBHOOK_USER    || "";  // optional
+const WEBHOOK_PASS    = process.env.WEBHOOK_PASS    || "";  // optional
+const REQUIRE_AUTH    = Boolean(WEBHOOK_USER && WEBHOOK_PASS);
 
-// CORS: allow your frontend to call this API
 app.use(cors({
   origin: FRONTEND_ORIGIN,
   methods: ["GET", "POST", "OPTIONS"],
 }));
 
-// -------- In-memory storage (replace with DB for persistence) --------
-const sessions  = new Map(); // alias -> { dobISO, dobPretty, email, messages: [], createdAt }
-const listeners = new Map(); // alias -> Set(res) for SSE
+// -------- In-memory (swap for DB in prod) --------
+// sessions: alias -> { dobISO, dobPretty, email, localPart, messages: [], createdAt }
+const sessions = new Map();
+// index: localPart -> alias   (so inbound can match quickly even if alias had mixed case/spaces)
+const indexByLocal = new Map();
+// SSE listeners: alias -> Set(res)
+const listeners = new Map();
 
 // -------- Helpers --------
 function randomNameAlias() {
@@ -55,6 +58,13 @@ function randomDOBOver21() {
   };
 }
 
+function sanitizeLocalPart(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "")
+    .slice(0, 64);
+}
+
 function addListener(alias, res) {
   if (!listeners.has(alias)) listeners.set(alias, new Set());
   listeners.get(alias).add(res);
@@ -72,14 +82,30 @@ function pushEvent(alias, event, data) {
   for (const res of set) res.write(payload);
 }
 
-function guardWebhook(req, res, next) {
-  if (!REQUIRE_AUTH) return next();
-  const creds = basicAuth(req);
-  if (!creds || creds.name !== WEBHOOK_USER || creds.pass !== WEBHOOK_PASS) {
-    res.set("WWW-Authenticate", 'Basic realm="postmark-inbound"');
-    return res.sendStatus(401);
+// Robust extraction of recipient local-part from Postmark payload
+function extractLocalPart(raw) {
+  // Prefer ToFull[0].Email if available
+  const toFull = Array.isArray(raw?.ToFull) ? raw.ToFull : [];
+  if (toFull.length && toFull[0]?.Email) {
+    return sanitizeLocalPart(toFull[0].Email.split("@")[0]);
   }
-  next();
+
+  // Fallback to raw.To (can be "Name <addr>, Name2 <addr2>" or "addr")
+  const toStr = String(raw?.To || "");
+  if (toStr) {
+    const first = toStr.split(",")[0].trim();
+    const m = first.match(/<([^>]+)>/);
+    const addr = (m ? m[1] : first).trim();
+    if (addr.includes("@")) return sanitizeLocalPart(addr.split("@")[0]);
+  }
+
+  // Last-ditch: some senders include X-Original-To / Delivered-To in Headers
+  const headers = Array.isArray(raw?.Headers) ? raw.Headers : [];
+  const findHeader = (name) => headers.find(h => String(h?.Name || "").toLowerCase() === name)?.Value;
+  const orig = findHeader("x-original-to") || findHeader("delivered-to");
+  if (orig && orig.includes("@")) return sanitizeLocalPart(orig.split("@")[0]);
+
+  return ""; // unknown
 }
 
 // -------- API: create session --------
@@ -90,22 +116,24 @@ app.post("/api/session", (req, res) => {
   if (sessions.has(alias)) return res.status(409).json({ error: "alias_exists" });
 
   const dob = randomDOBOver21();
-  const localPart = alias.replace(/[^a-z0-9-]/gi, "").slice(0, 64).toLowerCase()
-                  || crypto.randomBytes(4).toString("hex");
+  const localPart = sanitizeLocalPart(alias) || crypto.randomBytes(4).toString("hex");
   const email = `${localPart}@${INBOUND_DOMAIN}`;
 
-  sessions.set(alias, {
+  const session = {
     dobISO: dob.iso,
     dobPretty: dob.pretty,
     email,
+    localPart,
     messages: [],
     createdAt: new Date().toISOString()
-  });
+  };
+  sessions.set(alias, session);
+  indexByLocal.set(localPart, alias);
 
   return res.json({ alias, dobISO: dob.iso, dobPretty: dob.pretty, email });
 });
 
-// -------- API: list messages for alias (debug/fetch) --------
+// -------- API: list messages for alias --------
 app.get("/api/messages/:alias", (req, res) => {
   const sess = sessions.get(req.params.alias);
   res.json({ alias: req.params.alias, messages: sess?.messages || [] });
@@ -126,33 +154,54 @@ app.get("/api/stream/:alias", (req, res) => {
   if (sess?.messages?.length) {
     res.write(`event: backlog\ndata: ${JSON.stringify(sess.messages)}\n\n`);
   }
-
   addListener(alias, res);
   req.on("close", () => removeListener(alias, res));
 });
 
-// -------- Webhook: Postmark inbound (RAW JSON passthrough) --------
+// -------- Optional: simple inbound logger middleware --------
+app.use((req, _res, next) => {
+  if (req.path === "/inbound") {
+    console.log(">> /inbound hit", {
+      method: req.method,
+      contentType: req.headers["content-type"],
+      time: new Date().toISOString(),
+    });
+  }
+  next();
+});
+
+// -------- Webhook guard (Basic Auth) --------
+function guardWebhook(req, res, next) {
+  if (!REQUIRE_AUTH) return next();
+  const creds = basicAuth(req);
+  if (!creds || creds.name !== WEBHOOK_USER || creds.pass !== WEBHOOK_PASS) {
+    res.set("WWW-Authenticate", 'Basic realm="postmark-inbound"');
+    return res.sendStatus(401);
+  }
+  next();
+}
+
+// -------- Webhook: Postmark inbound --------
 app.post("/inbound", guardWebhook, (req, res) => {
   const raw = req.body || {};
   try {
-    // Postmark "To" is often "Name <email@domain>, ..."
-    const toField = String(raw.To || "").split(",")[0].trim();
-    const m = toField.match(/<([^>]+)>/);
-    const addr = m ? m[1] : toField;
-    const local = (addr.split("@")[0] || "").toLowerCase();
+    const local = extractLocalPart(raw);
+    const alias = indexByLocal.get(local);
 
-    const alias = local; // local-part is generated from alias already
-    const sess = sessions.get(alias);
+    console.log("   RAW To:", raw?.To);
+    if (raw?.ToFull)  console.log("   ToFull[0]:", raw.ToFull?.[0]);
+    console.log("   Resolved localPart:", local, "-> alias:", alias || "(unknown)");
 
-    if (!sess) {
-      // Unknown/expired alias: acknowledge to avoid retries/backscatter
+    if (!alias || !sessions.has(alias)) {
+      // Unknown/expired alias: acknowledge to avoid Postmark retries/backscatter
       return res.sendStatus(200);
     }
 
-    // Store entire RAW payload (exactly what Postmark sent)
+    const sess = sessions.get(alias);
+    // Store full RAW payload exactly as received from Postmark
     sess.messages.push(raw);
 
-    // Emit a simplified + raw event to SSE listeners
+    // Emit simplified + raw over SSE
     const simplified = {
       from: raw.From,
       to: raw.To,
@@ -168,16 +217,19 @@ app.post("/inbound", guardWebhook, (req, res) => {
     return res.sendStatus(200);
   } catch (err) {
     console.error("Inbound parse error:", err);
-    return res.sendStatus(200);
+    return res.sendStatus(200); // still OK to prevent retries
   }
 });
 
 // -------- Health --------
-app.get("/healthz", (_req, res) => res.json({ ok: true }));
+app.get("/healthz", (_req, res) => {
+  res.json({ ok: true, domain: INBOUND_DOMAIN, corsOrigin: FRONTEND_ORIGIN });
+});
 
 // -------- Boot --------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`API listening on ${PORT}`);
-  console.log(`Set Postmark Inbound Webhook URL to: https://<your-app>.up.railway.app/inbound`);
+  console.log(`Expect Postmark webhook at: https://<your-app>.up.railway.app/inbound`);
+  console.log(`Configured inbound domain: ${INBOUND_DOMAIN}`);
 });
