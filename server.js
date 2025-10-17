@@ -1,225 +1,230 @@
 // server.js
-// API for alias generation + inbound email handling (Postmark).
-// Endpoints:
-//   POST /api/session           -> { alias, dobISO, dobPretty, email }
-//   GET  /api/messages/:alias   -> { alias, messages: [rawPostmarkJson...] }
-//   GET  /api/stream/:alias     -> SSE stream (backlog + live)
-//   POST /inbound               -> Postmark inbound webhook (RAW JSON passthrough)
-//   GET  /healthz               -> { ok: true, domain, corsOrigin }
-
-import express from "express";
-import cors from "cors";
-import basicAuth from "basic-auth";
-import crypto from "crypto";
-import { FIRST_NAMES, LAST_NAMES } from "./names.js";
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
 
 const app = express();
-app.use(express.json({ limit: "15mb" }));
+const PORT = process.env.PORT || 3000;
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const DATA_PATH = path.join(DATA_DIR, 'data.json');
 
-// -------- CONFIG (env) --------
-const INBOUND_DOMAIN  = process.env.INBOUND_DOMAIN  || "in.refnull.net";
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*"; // set to your Pages/host URL in prod
-const WEBHOOK_USER    = process.env.WEBHOOK_USER    || "";  // optional
-const WEBHOOK_PASS    = process.env.WEBHOOK_PASS    || "";  // optional
-const REQUIRE_AUTH    = Boolean(WEBHOOK_USER && WEBHOOK_PASS);
+app.use(cors());
+app.use(express.json());
 
-app.use(cors({
-  origin: FRONTEND_ORIGIN,
-  methods: ["GET", "POST", "OPTIONS"],
-}));
-
-// -------- In-memory (swap for DB in prod) --------
-// sessions: alias -> { dobISO, dobPretty, email, localPart, baseLocal, messages: [], createdAt }
-const sessions = new Map();
-// index: local/base local-part -> alias
-const indexByLocal = new Map();
-// SSE listeners: alias -> Set(res)
-const listeners = new Map();
-
-// -------- Helpers --------
-function randomNameAlias() {
-  const first = FIRST_NAMES[Math.floor(Math.random() * FIRST_NAMES.length)];
-  const last  = LAST_NAMES[Math.floor(Math.random() * LAST_NAMES.length)];
-  const suffix = Math.random() < 0.35 ? String(Math.floor(Math.random() * 900 + 100)) : "";
-  return `${first}-${last}${suffix}`; // e.g., "Jordan-Wright482"
+// generate 15-digit numeric code on startup
+function gen15Digit() {
+  let s = '';
+  while (s.length < 15) {
+    s += String(Math.floor(Math.random() * 10));
+  }
+  return s.slice(0, 15);
 }
-function randomDOBOver21() {
-  const now = new Date();
-  const age = Math.floor(Math.random() * (50 - 21 + 1)) + 21; // 21..50
-  const y = now.getFullYear() - age;
-  const m = Math.floor(Math.random() * 12);         // 0..11
-  const d = Math.floor(Math.random() * 28) + 1;     // 1..28
-  const dt = new Date(y, m, d);
-  const pad = (n) => String(n).padStart(2, "0");
-  return {
-    iso: dt.toISOString().slice(0, 10),
-    pretty: `${pad(dt.getMonth() + 1)}/${pad(dt.getDate())}/${dt.getFullYear()}`
+const STARTUP_SECONDARY = gen15Digit();
+console.log('SECONDARY_CODE:', STARTUP_SECONDARY);
+
+// simple bootstrap that stores hashed PINs
+function bootstrapData() {
+  if (fs.existsSync(DATA_PATH)) return;
+  const raw = [
+    { name: 'Daniel', pin: '0623' },
+    { name: 'David', pin: '0305' },
+    { name: 'Arnoldo', pin: '0716' },
+    { name: 'Callen', pin: '0621' },
+    { name: 'William', pin: '0115' }
+  ];
+  const members = raw.map(m => ({ name: m.name, pinHash: bcrypt.hashSync(String(m.pin), 10) }));
+  const initial = { members, candidates: [] };
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(DATA_PATH, JSON.stringify(initial, null, 2));
+}
+function load() { bootstrapData(); return JSON.parse(fs.readFileSync(DATA_PATH, 'utf8')); }
+function save(d) { fs.writeFileSync(DATA_PATH, JSON.stringify(d, null, 2)); }
+
+const makeId = () => crypto.randomBytes(6).toString('base64url').slice(0,9);
+
+function memberNames(d) { return d.members.map(m => m.name); }
+function countYes(v = {}) { return Object.values(v).filter(x => x === true).length; }
+function countNo(v = {}) { return Object.values(v).filter(x => x === false).length; }
+
+function recomputeStatus(candidate, membersArr) {
+  const names = membersArr.map(m => m.name);
+  const votes = candidate.votes || {};
+  const total = names.length;
+  const votedCount = Object.keys(votes).length;
+  const allYes = total > 0 && names.every(n => votes[n] === true);
+  const allNo  = total > 0 && votedCount === total && names.every(n => votes[n] === false);
+  if (allYes) { candidate.status = 'banned'; candidate.ratified = true; }
+  else if (allNo) { candidate.status = 'allowed'; candidate.ratified = false; }
+  else { candidate.status = 'pending'; candidate.ratified = false; }
+  candidate.totalMembers = total;
+}
+function recomputeAll(d) { d.candidates.forEach(c => recomputeStatus(c, d.members)); }
+
+/**
+ * Rate limiting
+ * - global limiter for auth endpoints (fast path)
+ * - custom handler returns 429 + JSON including the insult string so it's visible in network tab only
+ */
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({ error: 'Too many requests', note: 'get fucked william' });
+  }
+});
+app.use('/auth', authLimiter);
+app.use('/auth/2', authLimiter);
+
+// per-member failed attempt tracking & lockout
+const FAILED = {}; // FAILED[memberName] = { count, firstTs }
+const MAX_FAIL = 5;
+const LOCKOUT_MS = 30 * 60 * 1000; // 30 minutes
+
+function registerFail(memberName) {
+  const now = Date.now();
+  if (!FAILED[memberName]) FAILED[memberName] = { count: 0, firstTs: now, lockedUntil: 0 };
+  const rec = FAILED[memberName];
+  if (rec.lockedUntil && now < rec.lockedUntil) return;
+  rec.count += 1;
+  if (rec.count >= MAX_FAIL) rec.lockedUntil = now + LOCKOUT_MS;
+}
+function clearFails(memberName) { delete FAILED[memberName]; }
+function isLocked(memberName) {
+  const rec = FAILED[memberName];
+  if (!rec) return false;
+  if (rec.lockedUntil && Date.now() < rec.lockedUntil) return true;
+  if (Date.now() - rec.firstTs > 60 * 60 * 1000) { delete FAILED[memberName]; return false; }
+  return false;
+}
+
+/* ---------- endpoints ---------- */
+app.get('/', (_req, res) => res.send('Ratify backend running'));
+
+app.post('/auth', (req, res) => {
+  const { memberName, pin } = req.body || {};
+  if (!memberName || !pin) return res.status(400).json({ error: 'memberName and pin required' });
+  if (isLocked(memberName)) return res.status(429).json({ error: 'locked', note: 'get fucked william' });
+  const d = load();
+  const m = d.members.find(x => x.name === memberName);
+  if (!m) return res.status(404).json({ error: 'member not found' });
+  const ok = bcrypt.compareSync(String(pin), m.pinHash);
+  if (!ok) { registerFail(memberName); return res.status(401).json({ error: 'invalid pin' }); }
+  clearFails(memberName);
+  if (memberName === 'Daniel') {
+    return res.json({ need2fa: true });
+  } else {
+    return res.json({ ok: true, memberName });
+  }
+});
+
+app.post('/auth/2', (req, res) => {
+  const { memberName, secondary } = req.body || {};
+  if (!memberName || !secondary) return res.status(400).json({ error: 'memberName and secondary required' });
+  if (memberName !== 'Daniel') return res.status(400).json({ error: 'not applicable' });
+  if (isLocked(memberName)) return res.status(429).json({ error: 'locked', note: 'get fucked william' });
+  if (String(secondary) !== STARTUP_SECONDARY) { registerFail(memberName); return res.status(401).json({ error: 'invalid secondary' }); }
+  clearFails(memberName);
+  return res.json({ ok: true, memberName });
+});
+
+app.get('/members', (req, res) => {
+  const d = load();
+  res.json({ members: memberNames(d) });
+});
+
+app.post('/members', (req, res) => {
+  const { name, pin } = req.body || {};
+  if (!name || !pin) return res.status(400).json({ error: 'name and pin required' });
+  const d = load();
+  if (d.members.find(m => m.name === name)) return res.status(409).json({ error: 'member exists' });
+  d.members.push({ name, pinHash: bcrypt.hashSync(String(pin), 10) });
+  recomputeAll(d);
+  save(d);
+  res.json({ message: 'member added', members: memberNames(d) });
+});
+
+app.get('/candidates', (req, res) => {
+  const d = load();
+  recomputeAll(d);
+  res.json({ candidates: d.candidates });
+});
+
+app.post('/candidates', (req, res) => {
+  const { firstName, lastInitial, notes } = req.body || {};
+  if (!firstName || !lastInitial) return res.status(400).json({ error: 'firstName and lastInitial required' });
+  const d = load();
+  const dupe = d.candidates.find(c =>
+    String(c.firstName).toLowerCase() === String(firstName).toLowerCase() &&
+    String(c.lastInitial).toLowerCase() === String(lastInitial).slice(0,1).toLowerCase()
+  );
+  if (dupe) return res.status(409).json({ error: 'name already exists' });
+  const candidate = {
+    id: makeId(),
+    firstName: String(firstName),
+    lastInitial: String(lastInitial).slice(0,1).toUpperCase(),
+    notes: notes || '',
+    votes: {},
+    status: 'pending',
+    ratified: false,
+    totalMembers: load().members.length,
+    createdAt: new Date().toISOString()
   };
-}
-function sanitizeLocalPart(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, "")
-    .slice(0, 64);
-}
-function addListener(alias, res) {
-  if (!listeners.has(alias)) listeners.set(alias, new Set());
-  listeners.get(alias).add(res);
-}
-function removeListener(alias, res) {
-  const set = listeners.get(alias);
-  if (!set) return;
-  set.delete(res);
-  if (!set.size) listeners.delete(alias);
-}
-function pushEvent(alias, event, data) {
-  const set = listeners.get(alias);
-  if (!set) return;
-  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const res of set) res.write(payload);
-}
-// Robust extraction of recipient local-part from Postmark payload
-function extractLocalPart(raw) {
-  const toFull = Array.isArray(raw?.ToFull) ? raw.ToFull : [];
-  if (toFull.length && toFull[0]?.Email) {
-    return sanitizeLocalPart(toFull[0].Email.split("@")[0]);
-  }
-  const toStr = String(raw?.To || "");
-  if (toStr) {
-    const first = toStr.split(",")[0].trim();
-    const m = first.match(/<([^>]+)>/);
-    const addr = (m ? m[1] : first).trim();
-    if (addr.includes("@")) return sanitizeLocalPart(addr.split("@")[0]);
-  }
-  const headers = Array.isArray(raw?.Headers) ? raw.Headers : [];
-  const findHeader = (name) => headers.find(h => String(h?.Name || "").toLowerCase() === name)?.Value;
-  const orig = findHeader("x-original-to") || findHeader("delivered-to");
-  if (orig && orig.includes("@")) return sanitizeLocalPart(orig.split("@")[0]);
-  return "";
-}
-
-// -------- API: create session --------
-app.post("/api/session", (req, res) => {
-  const aliasInput = (req.body?.alias || "").trim();
-  const alias = (aliasInput || randomNameAlias()).replace(/\s+/g, "-");
-  if (sessions.has(alias)) return res.status(409).json({ error: "alias_exists" });
-
-  const dob = randomDOBOver21();
-  const localPart = sanitizeLocalPart(alias) || crypto.randomBytes(4).toString("hex");
-  const baseLocal = localPart.replace(/\d+$/,""); // for tolerant matching (with/without numeric suffix)
-  const email = `${localPart}@${INBOUND_DOMAIN}`;
-
-  const session = {
-    dobISO: dob.iso,
-    dobPretty: dob.pretty,
-    email,
-    localPart,
-    baseLocal,
-    messages: [],
-    createdAt: new Date().toISOString(),
-  };
-  sessions.set(alias, session);
-  indexByLocal.set(localPart, alias);
-  if (baseLocal && baseLocal !== localPart) indexByLocal.set(baseLocal, alias);
-
-  return res.json({ alias, dobISO: dob.iso, dobPretty: dob.pretty, email });
+  d.candidates.push(candidate);
+  recomputeAll(d);
+  save(d);
+  res.json({ message: 'candidate added', candidate });
 });
 
-// -------- API: list messages for alias --------
-app.get("/api/messages/:alias", (req, res) => {
-  const sess = sessions.get(req.params.alias);
-  res.json({ alias: req.params.alias, messages: sess?.messages || [] });
-});
-
-// -------- API: SSE stream for alias --------
-app.get("/api/stream/:alias", (req, res) => {
-  res.set({
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "X-Accel-Buffering": "no"
-  });
-  res.flushHeaders();
-
-  const { alias } = req.params;
-  const sess = sessions.get(alias);
-  if (sess?.messages?.length) {
-    res.write(`event: backlog\ndata: ${JSON.stringify(sess.messages)}\n\n`);
+app.post('/vote', (req, res) => {
+  const { candidateId, memberName, vote } = req.body || {};
+  if (!candidateId || !memberName || typeof vote !== 'boolean') {
+    return res.status(400).json({ error: 'candidateId, memberName, vote(boolean) required' });
   }
-  addListener(alias, res);
-  req.on("close", () => removeListener(alias, res));
+  const d = load();
+  const c = d.candidates.find(x => x.id === candidateId);
+  if (!c) return res.status(404).json({ error: 'candidate not found' });
+  if (!d.members.find(m => m.name === memberName)) return res.status(400).json({ error: 'member not recognized' });
+  c.votes = c.votes || {};
+  c.votes[memberName] = !!vote;
+  recomputeStatus(c, d.members);
+  save(d);
+  res.json({ message: 'vote recorded', candidate: c });
 });
 
-// -------- Optional: inbound logger --------
-app.use((req, _res, next) => {
-  if (req.path === "/inbound") {
-    console.log(">> /inbound hit", {
-      method: req.method,
-      contentType: req.headers["content-type"],
-      time: new Date().toISOString(),
-    });
+app.patch('/candidates/:id', (req, res) => {
+  const { id } = req.params;
+  const { action, status, mode } = req.body || {};
+  const d = load();
+  const idx = d.candidates.findIndex(c => c.id === id);
+  if (idx < 0) return res.status(404).json({ error: 'candidate not found' });
+  const c = d.candidates[idx];
+  switch (action) {
+    case 'reopen':
+      c.votes = {}; c.status = 'pending'; c.ratified = false;
+      break;
+    case 'delete':
+      d.candidates.splice(idx, 1); save(d); return res.json({ message: 'deleted', id });
+    case 'setStatus':
+      if (!['banned','allowed','pending'].includes(status)) return res.status(400).json({ error: 'invalid status' });
+      c.status = status; c.ratified = status === 'banned';
+      if (status === 'banned' || status === 'allowed') {
+        const yes = status === 'banned'; c.votes = {}; memberNames(d).forEach(n => { c.votes[n] = yes; });
+      } else c.votes = {};
+      break;
+    default:
+      return res.status(400).json({ error: 'unknown action' });
   }
-  next();
+  recomputeStatus(c, d.members);
+  save(d);
+  res.json({ message: 'updated', candidate: c });
 });
 
-// -------- Webhook guard (Basic Auth) --------
-function guardWebhook(req, res, next) {
-  if (!REQUIRE_AUTH) return next();
-  const creds = basicAuth(req);
-  if (!creds || creds.name !== WEBHOOK_USER || creds.pass !== WEBHOOK_PASS) {
-    res.set("WWW-Authenticate", 'Basic realm="postmark-inbound"');
-    return res.sendStatus(401);
-  }
-  next();
-}
-
-// -------- Webhook: Postmark inbound --------
-app.post("/inbound", guardWebhook, (req, res) => {
-  const raw = req.body || {};
-  try {
-    const local = extractLocalPart(raw);        // e.g., "teagan-pena482" or "teagan-pena"
-    const base  = local.replace(/\d+$/,"");     // base w/o numeric suffix
-    let alias   = indexByLocal.get(local) || indexByLocal.get(base);
-
-    console.log("   RAW To:", raw?.To);
-    if (raw?.ToFull)  console.log("   ToFull[0]:", raw.ToFull?.[0]);
-    console.log("   Resolved localPart:", local, "base:", base, "-> alias:", alias || "(unknown)");
-
-    if (!alias || !sessions.has(alias)) return res.sendStatus(200);
-
-    const sess = sessions.get(alias);
-    // Store full RAW payload
-    sess.messages.push(raw);
-
-    // Emit simplified + raw over SSE
-    const simplified = {
-      from: raw.From,
-      to: raw.To,
-      subject: raw.Subject,
-      text: raw.TextBody,
-      html: raw.HtmlBody,
-      attachments: (raw.Attachments || []).map(a => ({
-        Name: a.Name, ContentType: a.ContentType, ContentLength: a.ContentLength
-      }))
-    };
-    pushEvent(alias, "email", { simplified, raw });
-
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error("Inbound parse error:", err);
-    return res.sendStatus(200);
-  }
-});
-
-// -------- Health --------
-app.get("/healthz", (_req, res) => {
-  res.json({ ok: true, domain: INBOUND_DOMAIN, corsOrigin: FRONTEND_ORIGIN });
-});
-
-// -------- Boot --------
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`API listening on ${PORT}`);
-  console.log(`Expect Postmark webhook at: https://<your-app>.up.railway.app/inbound`);
-  console.log(`Configured inbound domain: ${INBOUND_DOMAIN}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server listening on http://0.0.0.0:${PORT}`);
 });
