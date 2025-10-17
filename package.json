@@ -2,9 +2,9 @@
   "name": "ratify-banlist",
   "version": "1.0.0",
   "private": true,
-  "main": "server.js",
+  "main": "server.cjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.cjs"
   },
   "engines": {
     "node": ">=18"
