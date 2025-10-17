@@ -1,9 +1,9 @@
 // server.js
-// API-only backend for alias generation + inbound email handling (Postmark).
+// API for alias generation + inbound email handling (Postmark).
 // Endpoints:
 //   POST /api/session           -> { alias, dobISO, dobPretty, email }
 //   GET  /api/messages/:alias   -> { alias, messages: [rawPostmarkJson...] }
-//   GET  /api/stream/:alias     -> SSE stream for live messages
+//   GET  /api/stream/:alias     -> SSE stream (backlog + live)
 //   POST /inbound               -> Postmark inbound webhook (RAW JSON passthrough)
 //   GET  /healthz               -> { ok: true, domain, corsOrigin }
 
@@ -29,9 +29,9 @@ app.use(cors({
 }));
 
 // -------- In-memory (swap for DB in prod) --------
-// sessions: alias -> { dobISO, dobPretty, email, localPart, messages: [], createdAt }
+// sessions: alias -> { dobISO, dobPretty, email, localPart, baseLocal, messages: [], createdAt }
 const sessions = new Map();
-// index: localPart -> alias   (so inbound can match quickly even if alias had mixed case/spaces)
+// index: local/base local-part -> alias
 const indexByLocal = new Map();
 // SSE listeners: alias -> Set(res)
 const listeners = new Map();
@@ -43,7 +43,6 @@ function randomNameAlias() {
   const suffix = Math.random() < 0.35 ? String(Math.floor(Math.random() * 900 + 100)) : "";
   return `${first}-${last}${suffix}`; // e.g., "Jordan-Wright482"
 }
-
 function randomDOBOver21() {
   const now = new Date();
   const age = Math.floor(Math.random() * (50 - 21 + 1)) + 21; // 21..50
@@ -57,14 +56,12 @@ function randomDOBOver21() {
     pretty: `${pad(dt.getMonth() + 1)}/${pad(dt.getDate())}/${dt.getFullYear()}`
   };
 }
-
 function sanitizeLocalPart(s) {
   return String(s || "")
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, "")
     .slice(0, 64);
 }
-
 function addListener(alias, res) {
   if (!listeners.has(alias)) listeners.set(alias, new Set());
   listeners.get(alias).add(res);
@@ -81,16 +78,12 @@ function pushEvent(alias, event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of set) res.write(payload);
 }
-
 // Robust extraction of recipient local-part from Postmark payload
 function extractLocalPart(raw) {
-  // Prefer ToFull[0].Email if available
   const toFull = Array.isArray(raw?.ToFull) ? raw.ToFull : [];
   if (toFull.length && toFull[0]?.Email) {
     return sanitizeLocalPart(toFull[0].Email.split("@")[0]);
   }
-
-  // Fallback to raw.To (can be "Name <addr>, Name2 <addr2>" or "addr")
   const toStr = String(raw?.To || "");
   if (toStr) {
     const first = toStr.split(",")[0].trim();
@@ -98,25 +91,22 @@ function extractLocalPart(raw) {
     const addr = (m ? m[1] : first).trim();
     if (addr.includes("@")) return sanitizeLocalPart(addr.split("@")[0]);
   }
-
-  // Last-ditch: some senders include X-Original-To / Delivered-To in Headers
   const headers = Array.isArray(raw?.Headers) ? raw.Headers : [];
   const findHeader = (name) => headers.find(h => String(h?.Name || "").toLowerCase() === name)?.Value;
   const orig = findHeader("x-original-to") || findHeader("delivered-to");
   if (orig && orig.includes("@")) return sanitizeLocalPart(orig.split("@")[0]);
-
-  return ""; // unknown
+  return "";
 }
 
 // -------- API: create session --------
 app.post("/api/session", (req, res) => {
   const aliasInput = (req.body?.alias || "").trim();
   const alias = (aliasInput || randomNameAlias()).replace(/\s+/g, "-");
-
   if (sessions.has(alias)) return res.status(409).json({ error: "alias_exists" });
 
   const dob = randomDOBOver21();
   const localPart = sanitizeLocalPart(alias) || crypto.randomBytes(4).toString("hex");
+  const baseLocal = localPart.replace(/\d+$/,""); // for tolerant matching (with/without numeric suffix)
   const email = `${localPart}@${INBOUND_DOMAIN}`;
 
   const session = {
@@ -124,11 +114,13 @@ app.post("/api/session", (req, res) => {
     dobPretty: dob.pretty,
     email,
     localPart,
+    baseLocal,
     messages: [],
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
   };
   sessions.set(alias, session);
   indexByLocal.set(localPart, alias);
+  if (baseLocal && baseLocal !== localPart) indexByLocal.set(baseLocal, alias);
 
   return res.json({ alias, dobISO: dob.iso, dobPretty: dob.pretty, email });
 });
@@ -158,7 +150,7 @@ app.get("/api/stream/:alias", (req, res) => {
   req.on("close", () => removeListener(alias, res));
 });
 
-// -------- Optional: simple inbound logger middleware --------
+// -------- Optional: inbound logger --------
 app.use((req, _res, next) => {
   if (req.path === "/inbound") {
     console.log(">> /inbound hit", {
@@ -185,20 +177,18 @@ function guardWebhook(req, res, next) {
 app.post("/inbound", guardWebhook, (req, res) => {
   const raw = req.body || {};
   try {
-    const local = extractLocalPart(raw);
-    const alias = indexByLocal.get(local);
+    const local = extractLocalPart(raw);        // e.g., "teagan-pena482" or "teagan-pena"
+    const base  = local.replace(/\d+$/,"");     // base w/o numeric suffix
+    let alias   = indexByLocal.get(local) || indexByLocal.get(base);
 
     console.log("   RAW To:", raw?.To);
     if (raw?.ToFull)  console.log("   ToFull[0]:", raw.ToFull?.[0]);
-    console.log("   Resolved localPart:", local, "-> alias:", alias || "(unknown)");
+    console.log("   Resolved localPart:", local, "base:", base, "-> alias:", alias || "(unknown)");
 
-    if (!alias || !sessions.has(alias)) {
-      // Unknown/expired alias: acknowledge to avoid Postmark retries/backscatter
-      return res.sendStatus(200);
-    }
+    if (!alias || !sessions.has(alias)) return res.sendStatus(200);
 
     const sess = sessions.get(alias);
-    // Store full RAW payload exactly as received from Postmark
+    // Store full RAW payload
     sess.messages.push(raw);
 
     // Emit simplified + raw over SSE
@@ -217,7 +207,7 @@ app.post("/inbound", guardWebhook, (req, res) => {
     return res.sendStatus(200);
   } catch (err) {
     console.error("Inbound parse error:", err);
-    return res.sendStatus(200); // still OK to prevent retries
+    return res.sendStatus(200);
   }
 });
 
