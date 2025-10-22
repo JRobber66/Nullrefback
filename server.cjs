@@ -1,202 +1,193 @@
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const rateLimit = require('express-rate-limit');
-const crypto = require('crypto');
+const express = require("express");
+const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const { ImapFlow } = require("imapflow");
+const nodemailer = require("nodemailer");
+const crypto = require("crypto");
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-const DATA_DIR = process.env.DATA_DIR || __dirname;
-const DATA_PATH = path.join(DATA_DIR, 'data.json');
+// ===== Direct Configuration =====
+const CONFIG = {
+  HMAIL_HOST: "mail.refnull.net",      // your home mail server
+  IMAP_PORT: 993,
+  IMAP_SECURE: true,
+  SMTP_PORT: 587,
+  SMTP_SECURE: false,                  // false means STARTTLS
+  ALLOW_SELF_SIGNED: false,            // set true if self-signed cert
+  ALLOWED_ORIGIN: "https://jrobber66.github.io",
+  SESSION_TTL_MIN: 30                  // minutes
+};
 
-app.set('trust proxy', 1);
-app.use(cors({ origin: true }));
-app.use(express.json());
-
-function gen15Digit(){ let s=''; while(s.length<15) s+=String(Math.floor(Math.random()*10)); return s.slice(0,15); }
-const STARTUP_SECONDARY = gen15Digit();
-console.log('SECONDARY_CODE:', STARTUP_SECONDARY);
-
-function bootstrapData(){
-  if (fs.existsSync(DATA_PATH)) return;
-  const raw = [
-    { name:'Daniel',  pin:'0623' },
-    { name:'David',   pin:'0305' },
-    { name:'Arnoldo', pin:'0716' },
-    { name:'Callen',  pin:'0621' },
-    { name:'William', pin:'0115' }
-  ];
-  const members = raw.map(m => ({ name:m.name, pinHash:bcrypt.hashSync(String(m.pin),10) }));
-  const initial = { members, candidates: [] };
-  fs.mkdirSync(DATA_DIR, { recursive:true });
-  fs.writeFileSync(DATA_PATH, JSON.stringify(initial,null,2));
-}
-function load(){ bootstrapData(); return JSON.parse(fs.readFileSync(DATA_PATH,'utf8')); }
-function save(d){ fs.writeFileSync(DATA_PATH, JSON.stringify(d,null,2)); }
-const makeId = () => crypto.randomBytes(6).toString('base64url').slice(0,9);
-const memberNames = d => d.members.map(m=>m.name);
-
-function recomputeStatus(c, membersArr){
-  const names = membersArr.map(m=>m.name);
-  const votes = c.votes || {};
-  const total = names.length;
-  const voted = Object.keys(votes).length;
-  const allYes = total>0 && names.every(n=>votes[n]===true);
-  const allNo  = total>0 && voted===total && names.every(n=>votes[n]===false);
-  if (allYes){ c.status='banned'; c.ratified=true; }
-  else if (allNo){ c.status='allowed'; c.ratified=false; }
-  else { c.status='pending'; c.ratified=false; }
-  c.totalMembers = total;
-}
-function recomputeAll(d){ d.candidates.forEach(c => recomputeStatus(c,d.members)); }
-
-// per-member lockout
-const FAILED = {};
-const MAX_FAIL   = Number(process.env.AUTH_MAX_FAIL   || 5);
-const LOCKOUT_MS = Number(process.env.AUTH_LOCKOUT_MS || 30*60*1000);
-function registerFail(name){
-  const now=Date.now();
-  if (!FAILED[name]) FAILED[name]={count:0, firstTs:now, lockedUntil:0};
-  const r=FAILED[name];
-  if (r.lockedUntil && now<r.lockedUntil) return;
-  r.count += 1;
-  if (r.count >= MAX_FAIL) r.lockedUntil = now + LOCKOUT_MS;
-}
-function clearFails(name){ delete FAILED[name]; }
-function isLocked(name){
-  const r=FAILED[name]; if(!r) return false;
-  if (r.lockedUntil && Date.now()<r.lockedUntil) return true;
-  if (Date.now()-r.firstTs > 60*60*1000) { delete FAILED[name]; return false; }
-  return false;
-}
-
-// proxy-aware limiter keyed by IP + member
-const AUTH_WINDOW_MS = Number(process.env.AUTH_WINDOW_MS || 15*60*1000);
-const AUTH_MAX       = Number(process.env.AUTH_MAX       || 10);
-const authLimiter = rateLimit({
-  windowMs: AUTH_WINDOW_MS,
-  max: AUTH_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: req => {
-    const ip  = req.ip || req.connection?.remoteAddress || 'unknown';
-    const who = req.body?.memberName ? String(req.body.memberName) : 'unknown';
-    return `${ip}::${who}`;
-  },
-  handler: (req,res) => res.status(429).json({ error:'Too many requests', note:'get fucked william', windowMs:AUTH_WINDOW_MS, max:AUTH_MAX })
-});
-app.use('/auth', authLimiter);
-app.use('/auth/2', authLimiter);
-
-app.get('/', (_req,res)=>res.send('Ratify backend running'));
-
-// step 1
-app.post('/auth', (req,res)=>{
-  const { memberName, pin } = req.body || {};
-  if (!memberName || !pin) return res.status(400).json({ error:'memberName and pin required' });
-  if (isLocked(memberName)) return res.status(429).json({ error:'locked', note:'get fucked william' });
-  const d=load();
-  const m=d.members.find(x=>x.name===memberName);
-  if (!m) return res.status(404).json({ error:'member not found' });
-  const ok=bcrypt.compareSync(String(pin), m.pinHash);
-  if (!ok){ registerFail(memberName); return res.status(401).json({ error:'invalid pin' }); }
-  clearFails(memberName);
-  if (memberName==='Daniel') return res.json({ need2fa:true });
-  return res.json({ ok:true, memberName });
-});
-
-// step 2
-app.post('/auth/2', (req,res)=>{
-  const { memberName, secondary } = req.body || {};
-  if (!memberName || !secondary) return res.status(400).json({ error:'memberName and secondary required' });
-  if (memberName!=='Daniel') return res.status(400).json({ error:'not applicable' });
-  if (isLocked(memberName)) return res.status(429).json({ error:'locked', note:'get fucked william' });
-  if (String(secondary)!==STARTUP_SECONDARY){ registerFail(memberName); return res.status(401).json({ error:'invalid secondary' }); }
-  clearFails(memberName);
-  return res.json({ ok:true, memberName });
-});
-
-app.get('/members', (_req,res)=>{ const d=load(); res.json({ members: memberNames(d) }); });
-
-app.post('/members', (req,res)=>{
-  const { name, pin } = req.body || {};
-  if (!name || !pin) return res.status(400).json({ error:'name and pin required' });
-  const d=load();
-  if (d.members.find(m=>m.name===name)) return res.status(409).json({ error:'member exists' });
-  d.members.push({ name, pinHash:bcrypt.hashSync(String(pin),10) });
-  recomputeAll(d); save(d);
-  res.json({ message:'member added', members: memberNames(d) });
-});
-
-app.get('/candidates', (_req,res)=>{ const d=load(); recomputeAll(d); res.json({ candidates:d.candidates }); });
-
-app.post('/candidates', (req,res)=>{
-  const { firstName, lastInitial, notes } = req.body || {};
-  if (!firstName || !lastInitial) return res.status(400).json({ error:'firstName and lastInitial required' });
-  const d=load();
-  const dupe = d.candidates.find(c =>
-    String(c.firstName).toLowerCase() === String(firstName).toLowerCase() &&
-    String(c.lastInitial).toLowerCase() === String(lastInitial).slice(0,1).toLowerCase()
-  );
-  if (dupe) return res.status(409).json({ error:'name already exists' });
-  const candidate = {
-    id: makeId(),
-    firstName: String(firstName),
-    lastInitial: String(lastInitial).slice(0,1).toUpperCase(),
-    notes: notes || '',
-    votes: {},
-    status: 'pending',
-    ratified: false,
-    totalMembers: load().members.length,
-    createdAt: new Date().toISOString()
-  };
-  d.candidates.push(candidate);
-  recomputeAll(d); save(d);
-  res.json({ message:'candidate added', candidate });
-});
-
-app.post('/vote', (req,res)=>{
-  const { candidateId, memberName, vote } = req.body || {};
-  if (!candidateId || !memberName || typeof vote!=='boolean') return res.status(400).json({ error:'candidateId, memberName, vote(boolean) required' });
-  const d=load();
-  const c=d.candidates.find(x=>x.id===candidateId);
-  if (!c) return res.status(404).json({ error:'candidate not found' });
-  if (!d.members.find(m=>m.name===memberName)) return res.status(400).json({ error:'member not recognized' });
-  c.votes = c.votes || {}; c.votes[memberName]=!!vote;
-  recomputeStatus(c,d.members); save(d);
-  res.json({ message:'vote recorded', candidate:c });
-});
-
-app.patch('/candidates/:id', (req,res)=>{
-  const { id } = req.params;
-  const { action, status } = req.body || {};
-  const d=load();
-  const idx=d.candidates.findIndex(c=>c.id===id);
-  if (idx<0) return res.status(404).json({ error:'candidate not found' });
-  const c=d.candidates[idx];
-  switch(action){
-    case 'reopen': c.votes={}; c.status='pending'; c.ratified=false; break;
-    case 'delete': d.candidates.splice(idx,1); save(d); return res.json({ message:'deleted', id });
-    case 'setStatus':
-      if (!['banned','allowed','pending'].includes(status)) return res.status(400).json({ error:'invalid status' });
-      c.status=status; c.ratified=(status==='banned');
-      if (status==='banned' || status==='allowed'){ const yes=(status==='banned'); c.votes={}; memberNames(d).forEach(n=>{ c.votes[n]=yes; }); }
-      else { c.votes={}; }
-      break;
-    default: return res.status(400).json({ error:'unknown action' });
+// ===== In-memory session store =====
+const sessions = new Map(); // token -> { username, password, createdAt }
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, sess] of sessions) {
+    if (now - sess.createdAt > CONFIG.SESSION_TTL_MIN * 60_000) {
+      sessions.delete(token);
+    }
   }
-  recomputeStatus(c,d.members); save(d);
-  res.json({ message:'updated', candidate:c });
+}, 60_000);
+
+// ===== Helpers =====
+function newToken() { return crypto.randomUUID(); }
+function getAuth(req) {
+  const m = (req.headers.authorization || "").match(/^Bearer\s+(.+)$/i);
+  return m ? m[1] : null;
+}
+function requireSession(req, res, next) {
+  const token = getAuth(req);
+  if (!token || !sessions.has(token)) return res.status(401).json({ error: "Unauthorized" });
+  req.session = sessions.get(token);
+  next();
+}
+
+async function withImap({ username, password, fn }) {
+  const client = new ImapFlow({
+    host: CONFIG.HMAIL_HOST,
+    port: CONFIG.IMAP_PORT,
+    secure: CONFIG.IMAP_SECURE,
+    tls: CONFIG.ALLOW_SELF_SIGNED ? { rejectUnauthorized: false } : undefined,
+    auth: { user: username, pass: password }
+  });
+  try {
+    await client.connect();
+    return await fn(client);
+  } finally {
+    try { await client.logout(); } catch {}
+  }
+}
+
+function smtpTransport({ username, password }) {
+  return nodemailer.createTransport({
+    host: CONFIG.HMAIL_HOST,
+    port: CONFIG.SMTP_PORT,
+    secure: CONFIG.SMTP_SECURE,
+    tls: CONFIG.ALLOW_SELF_SIGNED ? { rejectUnauthorized: false } : undefined,
+    auth: { user: username, pass: password }
+  });
+}
+
+// ===== Express App =====
+const app = express();
+app.use(helmet());
+app.use(express.json({ limit: "200kb" }));
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || origin === CONFIG.ALLOWED_ORIGIN) cb(null, true);
+    else cb(new Error("CORS blocked"));
+  }
+}));
+app.use(rateLimit({
+  windowMs: 60_000,
+  max: 90,
+  standardHeaders: true
+}));
+
+// ===== Routes =====
+app.get("/api/health", (_req, res) => res.json({ ok: true, host: CONFIG.HMAIL_HOST }));
+
+// --- Login ---
+app.post("/api/login", async (req, res) => {
+  let { username, password } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: "username and password required" });
+  if (!username.includes("@")) username += "@refnull.net"; // auto-append domain
+  try {
+    await withImap({
+      username, password,
+      fn: async (client) => { await client.mailboxOpen("INBOX", { readOnly: true }); }
+    });
+    const token = newToken();
+    sessions.set(token, { username, password, createdAt: Date.now() });
+    res.json({ token, ttlMinutes: CONFIG.SESSION_TTL_MIN });
+  } catch (err) {
+    res.status(401).json({ error: "Invalid credentials", detail: err.message });
+  }
 });
 
-app.post('/admin/reset', (req,res)=>{
-  const hdr=req.headers['x-admin-secondary'];
-  if (hdr!==STARTUP_SECONDARY) return res.status(401).json({ error:'unauthorized' });
-  try{ fs.unlinkSync(DATA_PATH); }catch{}
-  bootstrapData();
-  res.json({ ok:true });
+// --- List messages ---
+app.get("/api/messages", requireSession, async (req, res) => {
+  const mailbox = req.query.mailbox || "INBOX";
+  const limit = Math.min(Number(req.query.limit || 25), 100);
+  try {
+    const result = await withImap({
+      username: req.session.username,
+      password: req.session.password,
+      fn: async (client) => {
+        await client.mailboxOpen(mailbox, { readOnly: true });
+        const total = client.mailbox.exists || 0;
+        const seqStart = Math.max(total - limit + 1, 1);
+        const list = [];
+        for await (const msg of client.fetch(`${seqStart}:*`, { envelope: true, uid: true, internalDate: true })) {
+          list.push({
+            uid: msg.uid,
+            date: msg.internalDate,
+            subject: msg.envelope.subject,
+            from: (msg.envelope.from || []).map(a => a.address).join(", ")
+          });
+        }
+        return list.reverse();
+      }
+    });
+    res.json({ mailbox, messages: result });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to list messages", detail: err.message });
+  }
 });
 
-app.listen(PORT,'0.0.0.0',()=>console.log(`Server listening on http://0.0.0.0:${PORT}`));
+// --- Read message ---
+app.get("/api/messages/:uid", requireSession, async (req, res) => {
+  const uid = Number(req.params.uid);
+  if (!uid) return res.status(400).json({ error: "invalid uid" });
+  try {
+    const text = await withImap({
+      username: req.session.username,
+      password: req.session.password,
+      fn: async (client) => {
+        await client.mailboxOpen("INBOX", { readOnly: true });
+        const stream = await client.download(uid, null, { uid: true });
+        return await streamToString(stream);
+      }
+    });
+    res.json({ uid, text });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch", detail: err.message });
+  }
+});
+function streamToString(stream) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    stream.on("data", (c) => data += c.toString("utf8"));
+    stream.on("end", () => resolve(data));
+    stream.on("error", reject);
+  });
+}
+
+// --- Send ---
+app.post("/api/send", requireSession, async (req, res) => {
+  const { to, subject, text } = req.body || {};
+  if (!to || !text) return res.status(400).json({ error: "to and text required" });
+  try {
+    const t = smtpTransport(req.session);
+    const info = await t.sendMail({
+      from: req.session.username,
+      to, subject, text
+    });
+    res.json({ ok: true, messageId: info.messageId });
+  } catch (err) {
+    res.status(500).json({ error: "send failed", detail: err.message });
+  }
+});
+
+// --- Logout ---
+app.post("/api/logout", requireSession, (req, res) => {
+  const token = getAuth(req);
+  sessions.delete(token);
+  res.json({ ok: true });
+});
+
+// ===== Start =====
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`refnull mail API running on port ${PORT}`);
+});
